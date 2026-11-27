@@ -6,6 +6,12 @@ import { getRedis } from '../redis.js';
 
 export const graderRouter = Router();
 
+const wrap =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<void> | void) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+
 function requireGraderToken(req: Request, res: Response, next: NextFunction): void {
   const token = req.header('x-grader-token');
   if (!token || token !== config.graderToken) {
@@ -17,7 +23,7 @@ function requireGraderToken(req: Request, res: Response, next: NextFunction): vo
 
 graderRouter.use(requireGraderToken);
 
-graderRouter.post('/reset', async (_req: Request, res: Response) => {
+graderRouter.post('/reset', wrap(async (_req: Request, res: Response) => {
   const db = await getDb();
   await Promise.all([
     db.collection('conversations').deleteMany({}),
@@ -43,9 +49,9 @@ graderRouter.post('/reset', async (_req: Request, res: Response) => {
   }
 
   res.status(200).json({ ok: true });
-});
+}));
 
-graderRouter.get('/snapshot', async (_req: Request, res: Response) => {
+graderRouter.get('/snapshot', wrap(async (_req: Request, res: Response) => {
   const db = await getDb();
   const [conversations, inboundMsgs, outboundMsgs] = await Promise.all([
     db.collection('conversations').find({}).toArray(),
@@ -98,9 +104,9 @@ graderRouter.get('/snapshot', async (_req: Request, res: Response) => {
   }
 
   res.json({ workspaces });
-});
+}));
 
-graderRouter.post('/reply', async (req: Request, res: Response) => {
+graderRouter.post('/reply', wrap(async (req: Request, res: Response) => {
   const { workspace, contact, text, client_ref } = (req.body ?? {}) as {
     workspace?: string;
     contact?: string;
@@ -118,9 +124,9 @@ graderRouter.post('/reply', async (req: Request, res: Response) => {
     return;
   }
   res.status(202).json({ ok: true, client_ref });
-});
+}));
 
-graderRouter.post('/claim', async (req: Request, res: Response) => {
+graderRouter.post('/claim', wrap(async (req: Request, res: Response) => {
   const { workspace, contact, agent } = (req.body ?? {}) as {
     workspace?: string;
     contact?: string;
@@ -136,4 +142,4 @@ graderRouter.post('/claim', async (req: Request, res: Response) => {
     return;
   }
   res.status(200).json({ ok: true, assignee: result.assignee });
-});
+}));

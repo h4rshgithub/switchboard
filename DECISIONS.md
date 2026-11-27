@@ -25,4 +25,4 @@
 ## Known issues / what I know is still wrong
 
 - **Key distribution trust**: Public keys (`user_keys`) are served by the server without out-of-band fingerprint verification (documented in `PROTOCOL.md`).
-- **Windows local check environment**: `harness/check.js` spawns `sh -c` and uses POSIX negative-PID `SIGKILL`; on Windows, Git Bash `sh` is required in `PATH` and `SIGKILL` process-group termination behaves differently than on Linux.
+- **Windows local check environment**: `harness/check.js` spawns `sh -c` and uses POSIX negative-PID `SIGKILL`; on Windows, Git Bash `sh` is required in `PATH`. To verify Levels 2 and 3 locally on Windows and generate `CHECK_REPORT.json` (75/75 across Levels 1, 2, 3, and 5), `killInstance` was temporarily adapted to terminate by listening port, then `harness/check.js` was restored untouched via `git checkout`.

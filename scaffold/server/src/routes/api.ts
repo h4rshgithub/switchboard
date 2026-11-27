@@ -12,7 +12,13 @@ import { emitWorkspaceEvent } from '../events.js';
 
 export const apiRouter = Router();
 
-apiRouter.use(requireAuth);
+const wrap =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<void> | void) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+
+apiRouter.use(wrap(requireAuth));
 
 apiRouter.get('/me', (req: Request, res: Response) => {
   const user = (req as Request & { user: SessionUser }).user;
