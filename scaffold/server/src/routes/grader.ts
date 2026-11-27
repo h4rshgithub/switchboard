@@ -24,6 +24,8 @@ graderRouter.post('/reset', async (_req: Request, res: Response) => {
     db.collection('messages').deleteMany({}),
     db.collection('outbound_messages').deleteMany({}),
     db.collection('notes').deleteMany({}),
+    db.collection('user_keys').deleteMany({}),
+    db.collection('workspace_key_envelopes').deleteMany({}),
   ]);
 
   const redis = getRedis();

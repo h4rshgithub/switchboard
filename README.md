@@ -1,59 +1,45 @@
 # Switchboard
 
-A shared team inbox for support agents. Multiple businesses (workspaces) use a single deployment; agents log in, see conversations in real time, claim and reply to them.
+A shared team inbox for support agents. Multiple workspaces (`ws_acme`, `ws_globex`) share one deployment with strict tenant isolation, real-time WebSocket updates, crash-safe outbound delivery, and end-to-end encrypted private notes.
 
 ## Quick start (from a clean clone)
 
 ```bash
-# 1. Start MongoDB and Redis (must be running on default ports)
-# If you have Docker:
+# 1. Start MongoDB, Redis, Pigeon, Mock IdP, and Paybox
 npm run up
+npm run doctor
 
 # 2. Install dependencies
-npm run scaffold:install   # or: npm install --prefix scaffold/server && npm install --prefix scaffold/web
+npm run scaffold:install
 
-# 3. Start the server
-npm --prefix scaffold/server start   # PORT defaults to 4000
+# 3. Start the server (uses PORT, default 4000)
+npm --prefix scaffold/server start
 
-# 4. (Optional) Start the web UI
-npm --prefix scaffold/web run dev    # on http://localhost:5173
+# 4. Start the React web UI (http://localhost:5173)
+npm --prefix scaffold/web run dev
 ```
 
-## Configuration
-
-All configuration comes from environment variables. Copy `.env.example` to `.env` to override defaults.
-
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `4000` | Server port |
-| `MONGO_URL` | `mongodb://localhost:27017/switchboard` | MongoDB connection |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
-| `PIGEON_WEBHOOK_SECRET` | `whsec_pigeon_dev` | Webhook signing secret |
-| `GRADER_TOKEN` | `grader-dev-token` | Check harness token |
-| `OIDC_ISSUER` | `http://localhost:4020` | OpenID Connect issuer |
-
-## Check commands
+## Running tests & checks
 
 ```bash
-npm run check           # Level 1 only (~90s)
-npm run check:full      # Levels 1,2,3,5 (~4m), writes CHECK_REPORT.json
-npm run doctor          # Verify all services are reachable
-```
+# Unit tests (signature verification, out-of-order status protection, cookie/role helpers)
+npm --prefix scaffold/server test
 
-**Stop your dev server before running checks** – the check starts its own server.
+# Typecheck server and web
+npm --prefix scaffold/server run typecheck
+npm --prefix scaffold/web run typecheck
+
+# Grader harness (stop your dev server first)
+npm run check
+npm run check:full
+```
 
 ## Architecture
 
-- **Server**: Express + TypeScript, `tsx` runtime
-- **Database**: MongoDB (conversations, messages, outbound queue, WS events)
-- **Cache/Queue**: Redis (sessions, distributed locks, rate-limit state, pub/sub)
-- **WebSocket**: `ws` library with Redis pub/sub for cross-instance delivery
-- **Frontend**: React + Vite
-
-### Key design decisions
-
-- Webhook deduplication via Redis `SET NX` on `x-pigeon-event-id`
-- Atomic conversation claim via MongoDB `findOneAndUpdate` with `{assignee: null}` filter
-- Outbound queue stored in MongoDB + Redis list; processor holds a Redis lock per workspace
-- WebSocket events persisted to MongoDB for replay (`?after=N`)
-- Rate limit state shared in Redis (key `rate:retry:<workspace>`)
+- **Server (`scaffold/server`)**: Express + TypeScript (`tsx`), MongoDB (`mongodb`), Redis (`ioredis`), WebSockets (`ws`).
+- **Web (`scaffold/web`)**: React 19 + Vite + Web Crypto API (ECDH P-256 + HKDF-SHA256 + AES-256-GCM for private notes; see `PROTOCOL.md`).
+- **Reliability**:
+  - **Inbound webhooks (`POST /webhooks/pigeon`)**: Raw-body HMAC-SHA256 verification with 5-minute replay window, `400` on malformed JSON, `200` on unknown event types/workspaces/statuses, and MongoDB unique index `{ workspace, message_id }` for idempotent deduplication. Messages are ordered by `occurred_at`.
+  - **Outbound replies**: Stored in MongoDB (`outbound_messages`) before returning `202`. Workers claim jobs with an 18s lease for multi-instance failover, send `Idempotency-Key`, and coordinate per-workspace token-bucket rate limiting and `Retry-After` cooldowns in Redis via Lua.
+  - **Atomic claim**: MongoDB `findOneAndUpdate` with `{ $or: [{ assignee: null }, { assignee: agent }] }` guarantees at most one winner.
+  - **Real-time & replay (`GET /ws`)**: Authenticated by OIDC session cookie and workspace membership; per-workspace `seq` via Redis `INCR`, history in Redis sorted set for `?after=<seq>` replay, and cross-instance fan-out via Redis Pub/Sub.

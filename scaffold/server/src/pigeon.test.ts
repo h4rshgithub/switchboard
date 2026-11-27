@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { describe, it } from 'node:test';
-import { verifyPigeonSignature } from './pigeon.js';
+import { shouldAdvanceStatus, verifyPigeonSignature } from './pigeon.js';
 
 const SECRET = 'whsec_test_secret';
 
@@ -43,5 +43,22 @@ describe('verifyPigeonSignature', () => {
     const header = sign(body.toString('utf8'), now);
     const tampered = Buffer.from('{"id":"evt_1","type":"message.inbound" }', 'utf8');
     assert.equal(verifyPigeonSignature(header, tampered, SECRET, now), false);
+  });
+});
+
+describe('shouldAdvanceStatus', () => {
+  it('advances queued -> sent -> delivered', () => {
+    assert.equal(shouldAdvanceStatus(1, 'sent'), 2);
+    assert.equal(shouldAdvanceStatus(2, 'delivered'), 3);
+  });
+
+  it('does not regress delivered -> sent when webhooks arrive out of order', () => {
+    assert.equal(shouldAdvanceStatus(3, 'sent'), null);
+    assert.equal(shouldAdvanceStatus(3, 'delivered'), null);
+    assert.equal(shouldAdvanceStatus(3, 'failed'), null);
+  });
+
+  it('ignores unknown status values', () => {
+    assert.equal(shouldAdvanceStatus(1, 'unknown_status'), null);
   });
 });

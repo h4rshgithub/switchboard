@@ -1,4 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  decryptNote,
+  encryptNote,
+  generateWorkspaceKey,
+  getOrCreateIdentityKeyPair,
+  unwrapWorkspaceKey,
+  wrapWorkspaceKeyForMember,
+} from './crypto';
 
 interface WorkspaceMembership {
   id: string;
@@ -29,6 +37,16 @@ interface Message {
   timestamp: string;
 }
 
+interface EncryptedNote {
+  note_id: string;
+  author: string;
+  ciphertext: string;
+  iv: string;
+  aad: string;
+  created_at: string;
+  plaintext?: string;
+}
+
 export function App() {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [workspace, setWorkspace] = useState<string>('');
@@ -41,10 +59,16 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [wsLive, setWsLive] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [workspaceKey, setWorkspaceKey] = useState<CryptoKey | null>(null);
+  const [notes, setNotes] = useState<EncryptedNote[]>([]);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [savingNote, setSavingNote] = useState(false);
 
   const lastSeqRef = useRef<number>(0);
   const selectedContactRef = useRef<string | null>(null);
   selectedContactRef.current = selectedContact;
+  const workspaceKeyRef = useRef<CryptoKey | null>(null);
+  workspaceKeyRef.current = workspaceKey;
 
   useEffect(() => {
     fetch('/api/me')
@@ -92,13 +116,89 @@ export function App() {
   }, [workspace, filter, loadConversations]);
 
   useEffect(() => {
+    if (!workspace || !user) {
+      setWorkspaceKey(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { publicKeyJwk, privateKey } = await getOrCreateIdentityKeyPair(user.sub);
+        await fetch(`/api/keys/me?workspace=${encodeURIComponent(workspace)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ workspace, publicKeyJwk }),
+        });
+        const res = await fetch(`/api/keys/workspace?workspace=${encodeURIComponent(workspace)}`);
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          envelope: { ephemeralPubJwk: JsonWebKey; iv: string; wrappedKey: string } | null;
+          hasAnyKey: boolean;
+          members: Array<{ sub: string; publicKeyJwk: JsonWebKey; hasKey: boolean }>;
+        };
+        let wk: CryptoKey | null = null;
+        if (data.envelope) {
+          wk = await unwrapWorkspaceKey(data.envelope, privateKey, workspace);
+        } else if (!data.hasAnyKey) {
+          wk = await generateWorkspaceKey();
+          const env = await wrapWorkspaceKeyForMember(wk, publicKeyJwk, workspace);
+          await fetch(`/api/keys/workspace?workspace=${encodeURIComponent(workspace)}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ workspace, recipient_sub: user.sub, ...env }),
+          });
+        }
+        if (wk && !cancelled) {
+          setWorkspaceKey(wk);
+          // Wrap workspace key for any member who registered a public key but lacks an envelope
+          for (const m of data.members) {
+            if (!m.hasKey && m.sub !== user.sub) {
+              const env = await wrapWorkspaceKeyForMember(wk, m.publicKeyJwk, workspace);
+              await fetch(`/api/keys/workspace?workspace=${encodeURIComponent(workspace)}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ workspace, recipient_sub: m.sub, ...env }),
+              });
+            }
+          }
+        }
+      } catch {
+        // E2E key setup failed; notes remain locked
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace, user]);
+
+  useEffect(() => {
     if (!workspace || !selectedContact) {
       setMessages([]);
+      setNotes([]);
       return;
     }
     setErrorMsg(null);
     void loadMessages(workspace, selectedContact);
-  }, [workspace, selectedContact, loadMessages]);
+    void (async () => {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(selectedContact)}/notes?workspace=${encodeURIComponent(workspace)}`
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as { notes: EncryptedNote[] };
+      const wk = workspaceKeyRef.current;
+      const decoded = await Promise.all(
+        data.notes.map(async (n) => {
+          if (!wk) return { ...n, plaintext: '[Encrypted — key unavailable]' };
+          try {
+            return { ...n, plaintext: await decryptNote(wk, n) };
+          } catch {
+            return { ...n, plaintext: '[Unable to decrypt]' };
+          }
+        })
+      );
+      setNotes(decoded);
+    })();
+  }, [workspace, selectedContact, workspaceKey, loadMessages]);
 
   // Real-time WebSocket with automatic reconnect & ?after=seq replay
   useEffect(() => {
@@ -182,6 +282,29 @@ export function App() {
           } else if (type === 'conversation.updated') {
             const status = frame.status as 'open' | 'closed';
             setConversations((prev) => prev.map((c) => (c.contact === contact ? { ...c, status } : c)));
+          } else if (type === 'note.created' && selectedContactRef.current === contact) {
+            const note: EncryptedNote = {
+              note_id: String(frame.note_id || ''),
+              author: String(frame.author || ''),
+              ciphertext: String(frame.ciphertext || ''),
+              iv: String(frame.iv || ''),
+              aad: String(frame.aad || ''),
+              created_at: String(frame.created_at || new Date().toISOString()),
+            };
+            const wk = workspaceKeyRef.current;
+            void (async () => {
+              let plaintext = '[Encrypted — key unavailable]';
+              if (wk) {
+                try {
+                  plaintext = await decryptNote(wk, note);
+                } catch {
+                  plaintext = '[Unable to decrypt]';
+                }
+              }
+              setNotes((prev) =>
+                prev.some((n) => n.note_id === note.note_id) ? prev : [...prev, { ...note, plaintext }]
+              );
+            })();
           }
         } catch {
           // ignore
@@ -264,6 +387,26 @@ export function App() {
   const handleLogout = async () => {
     await fetch('/auth/logout', { method: 'POST' });
     setUser(null);
+  };
+
+  const handleSaveNote = async () => {
+    if (!workspace || !selectedContact || !user || !workspaceKey || !noteDraft.trim() || savingNote) return;
+    setSavingNote(true);
+    try {
+      const aad = `${workspace}:${selectedContact}:${user.sub}`;
+      const encrypted = await encryptNote(workspaceKey, noteDraft.trim(), aad);
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(selectedContact)}/notes?workspace=${encodeURIComponent(workspace)}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ workspace, ...encrypted }),
+        }
+      );
+      if (res.ok) setNoteDraft('');
+    } finally {
+      setSavingNote(false);
+    }
   };
 
   if (user === undefined) {
@@ -437,6 +580,44 @@ export function App() {
             </>
           )}
         </section>
+
+        {selectedContact && (
+          <aside className="notes-panel">
+            <div className="notes-header">
+              <span>Private Notes</span>
+              <span className="badge">{workspaceKey ? 'E2EE Ready' : 'Locked'}</span>
+            </div>
+            <div className="notes-list">
+              {notes.length === 0 ? (
+                <div className="empty-state">No private notes</div>
+              ) : (
+                notes.map((n) => (
+                  <div key={n.note_id} className="note-card">
+                    <div className="note-meta">
+                      {n.author} · {new Date(n.created_at).toLocaleTimeString()}
+                    </div>
+                    <div>{n.plaintext}</div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="notes-composer">
+              <textarea
+                placeholder={workspaceKey ? 'Add encrypted internal note…' : 'Waiting for workspace key…'}
+                disabled={!workspaceKey}
+                value={noteDraft}
+                onChange={(e) => setNoteDraft(e.target.value)}
+              />
+              <button
+                className="btn"
+                disabled={!workspaceKey || savingNote || !noteDraft.trim()}
+                onClick={() => void handleSaveNote()}
+              >
+                {savingNote ? 'Encrypting…' : 'Add Note'}
+              </button>
+            </div>
+          </aside>
+        )}
       </div>
     </div>
   );

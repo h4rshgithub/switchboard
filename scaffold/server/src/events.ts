@@ -31,6 +31,16 @@ export type WorkspaceEventPayload =
       text: string;
       status: string;
       created_at: string;
+    }
+  | {
+      type: 'note.created';
+      contact: string;
+      note_id: string;
+      author: string;
+      ciphertext: string;
+      iv: string;
+      aad: string;
+      created_at: string;
     };
 
 export type SequencedEvent = WorkspaceEventPayload & {

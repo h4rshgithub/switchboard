@@ -27,6 +27,12 @@ async function ensureIndexes(db: Db): Promise<void> {
     db.collection('notes').createIndexes([
       { key: { workspace: 1, contact: 1, created_at: 1 } },
     ]),
+    db.collection('user_keys').createIndexes([
+      { key: { workspace: 1, sub: 1 }, unique: true },
+    ]),
+    db.collection('workspace_key_envelopes').createIndexes([
+      { key: { workspace: 1, recipient_sub: 1 }, unique: true },
+    ]),
   ]);
 }
 

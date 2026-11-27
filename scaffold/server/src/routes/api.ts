@@ -8,6 +8,7 @@ import {
   setConversationStatus,
   unclaimConversation,
 } from '../domain.js';
+import { emitWorkspaceEvent } from '../events.js';
 
 export const apiRouter = Router();
 
@@ -200,4 +201,151 @@ apiRouter.post('/conversations/:contact/status', requireWorkspaceMember, async (
     return;
   }
   res.json({ ok: true, status });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-End Encrypted Private Notes & Key Directory (server stores only
+// public keys, wrapped workspace key envelopes, and AES-GCM ciphertexts)
+// ---------------------------------------------------------------------------
+
+apiRouter.put('/keys/me', requireWorkspaceMember, async (req: Request, res: Response) => {
+  const user = (req as Request & { user: SessionUser }).user;
+  const workspace = (req as Request & { workspace: string }).workspace;
+  const publicKeyJwk = req.body?.publicKeyJwk;
+  if (!publicKeyJwk || typeof publicKeyJwk !== 'object') {
+    res.status(400).json({ error: 'Missing publicKeyJwk' });
+    return;
+  }
+  const db = await getDb();
+  await db.collection('user_keys').updateOne(
+    { workspace, sub: user.sub },
+    { $set: { workspace, sub: user.sub, publicKeyJwk, updated_at: new Date() } },
+    { upsert: true }
+  );
+  res.json({ ok: true });
+});
+
+apiRouter.get('/keys/workspace', requireWorkspaceMember, async (req: Request, res: Response) => {
+  const user = (req as Request & { user: SessionUser }).user;
+  const workspace = (req as Request & { workspace: string }).workspace;
+  const db = await getDb();
+  const [myEnvelope, members] = await Promise.all([
+    db.collection('workspace_key_envelopes').findOne({ workspace, recipient_sub: user.sub }),
+    db.collection('user_keys').find({ workspace }).toArray(),
+  ]);
+  const existingEnvelopes = await db
+    .collection('workspace_key_envelopes')
+    .find({ workspace }, { projection: { recipient_sub: 1 } })
+    .toArray();
+  const wrappedFor = new Set(existingEnvelopes.map((e) => String(e.recipient_sub)));
+
+  res.json({
+    envelope: myEnvelope
+      ? {
+          ephemeralPubJwk: myEnvelope.ephemeralPubJwk,
+          iv: myEnvelope.iv,
+          wrappedKey: myEnvelope.wrappedKey,
+        }
+      : null,
+    hasAnyKey: existingEnvelopes.length > 0,
+    members: members.map((m) => ({
+      sub: String(m.sub),
+      publicKeyJwk: m.publicKeyJwk,
+      hasKey: wrappedFor.has(String(m.sub)),
+    })),
+  });
+});
+
+apiRouter.post('/keys/workspace', requireWorkspaceMember, async (req: Request, res: Response) => {
+  const workspace = (req as Request & { workspace: string }).workspace;
+  const { recipient_sub, ephemeralPubJwk, iv, wrappedKey } = (req.body ?? {}) as {
+    recipient_sub?: string;
+    ephemeralPubJwk?: unknown;
+    iv?: string;
+    wrappedKey?: string;
+  };
+  if (!recipient_sub || !ephemeralPubJwk || !iv || !wrappedKey) {
+    res.status(400).json({ error: 'Missing key envelope fields' });
+    return;
+  }
+  const db = await getDb();
+  await db.collection('workspace_key_envelopes').updateOne(
+    { workspace, recipient_sub },
+    {
+      $set: {
+        workspace,
+        recipient_sub,
+        ephemeralPubJwk,
+        iv,
+        wrappedKey,
+        updated_at: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+  res.json({ ok: true });
+});
+
+apiRouter.get('/conversations/:contact/notes', requireWorkspaceMember, async (req: Request, res: Response) => {
+  const workspace = (req as Request & { workspace: string }).workspace;
+  const contact = req.params.contact;
+  const db = await getDb();
+  const docs = await db
+    .collection('notes')
+    .find({ workspace, contact })
+    .sort({ created_at: 1, _id: 1 })
+    .toArray();
+
+  res.json({
+    notes: docs.map((n) => ({
+      note_id: String(n.note_id),
+      author: String(n.author),
+      ciphertext: String(n.ciphertext),
+      iv: String(n.iv),
+      aad: String(n.aad),
+      created_at: (n.created_at instanceof Date ? n.created_at : new Date(n.created_at)).toISOString(),
+    })),
+  });
+});
+
+apiRouter.post('/conversations/:contact/notes', requireWorkspaceMember, async (req: Request, res: Response) => {
+  const user = (req as Request & { user: SessionUser }).user;
+  const workspace = (req as Request & { workspace: string }).workspace;
+  const contact = req.params.contact;
+  const { ciphertext, iv, aad } = (req.body ?? {}) as {
+    ciphertext?: string;
+    iv?: string;
+    aad?: string;
+  };
+  if (!ciphertext || !iv || !aad) {
+    res.status(400).json({ error: 'Missing ciphertext, iv, or aad' });
+    return;
+  }
+
+  const noteId = `note_${randomUUID()}`;
+  const now = new Date();
+  const db = await getDb();
+  await db.collection('notes').insertOne({
+    note_id: noteId,
+    workspace,
+    contact,
+    author: user.sub,
+    ciphertext,
+    iv,
+    aad,
+    created_at: now,
+  });
+
+  await emitWorkspaceEvent(workspace, {
+    type: 'note.created',
+    contact,
+    note_id: noteId,
+    author: user.sub,
+    ciphertext,
+    iv,
+    aad,
+    created_at: now.toISOString(),
+  });
+
+  res.status(201).json({ ok: true, note_id: noteId });
 });

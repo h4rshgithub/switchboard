@@ -2,28 +2,27 @@
 
 ## What I built
 
-- **Levels 1 and 2**: Complete. Webhook ingestion with signature verification, deduplication, ordering by `occurred_at`; atomic conversation claiming; outbound queue with Pigeon rate-limit and retry handling; crash recovery via persistent queue in MongoDB + Redis.
-- **Level 3**: Queue processor uses a Redis distributed lock per workspace so only one instance sends at a time, sharing the rate-limit window. WebSocket events are delivered cross-instance via Redis pub/sub. Inbound dedup via Redis SET NX is naturally cross-instance. Failover: surviving instances pick up orphaned queued messages on their 2-second polling cycle.
-- **Level 5**: OIDC login (authorization code + PKCE S256). Session stored in Redis. `/api/me`, `/api/conversations` enforce tenant isolation. WebSocket authenticated by session cookie, refuses strangers and cross-workspace access; `?after=N` replays from MongoDB.
-- **Frontend**: React app with real-time inbox (WebSocket), conversation view, claim/unclaim, reply with optimistic status updates.
+- **Core product & resilience (Levels 1, 2, 3, 5 + Level 4 rules)**:
+  - **Inbound webhooks (`POST /webhooks/pigeon`)**: Verifies `x-pigeon-signature` against the exact raw request body (`express.raw`) with `timingSafeEqual` and a 300-second replay window (`401` on missing/invalid/stale, `400` on malformed JSON, `200` on unknown `type` or unknown `workspace`). Deduplicates on MongoDB unique index `{ workspace, message_id }` and sorts inbound messages by `occurred_at`.
+  - **Outbound outbox & worker**: `POST /__grader/reply` and `POST /api/conversations/:contact/reply` persist to `outbound_messages` in MongoDB before returning `202`. Background workers across all instances claim jobs using an 18s MongoDB lease (`lease_until`), send `Idempotency-Key: <workspace>:<client_ref>`, and share a Redis Lua token-bucket rate limiter (7 capacity, 3.5/s refill) + `Retry-After` cooldown key (`pigeon:cooldown:<workspace>`). Status webhooks advance monotonically via `status_rank` (`queued < sent < delivered|failed`) so out-of-order `sent` after `delivered` is ignored.
+  - **Atomic claim**: `findOneAndUpdate` on `{ workspace, contact, $or: [{ assignee: null }, { assignee: agent }] }`.
+  - **OIDC Login & Tenant Isolation**: Authorization Code + PKCE (`S256`), `id_token` RS256 verification against `/jwks`, Redis-backed `HttpOnly` session cookies (`sb_session`), workspace membership checks on `/api/*` and `/ws`.
+  - **Real-time WebSocket**: Redis `INCR` for per-workspace `seq`, Redis `ZSET` for `?after=N` replay, and Redis Pub/Sub for cross-instance delivery with buffering during replay so no frames are missed or duplicated.
+- **Frontend (`scaffold/web`)**: React inbox with workspace switcher, open/closed/all filters, pagination, real-time WebSocket updates with auto-reconnect (`?after=`), claim/release/close/reopen controls, and outbound status badges.
+- **End-to-End Encrypted Private Notes (`PROTOCOL.md`)**: Browser-side ECDH P-256 identity keys + HKDF-SHA256 + AES-256-GCM workspace key wrapping and note encryption.
+- **Tests**: Unit tests in `scaffold/server/src/pigeon.test.ts` and `auth.test.ts` using `node:test`.
 
 ## What I cut
 
-- **Private encrypted notes**: Not implemented. Would need E2E encryption with per-workspace key exchange.
-- **Elasticsearch search**: Not implemented; memory on this machine was insufficient for Elasticsearch.
-- **Tests**: No automated tests; manual verification via `npm run check`.
-- **Bonus billing (Paybox)**: Not implemented.
+- **Elasticsearch search**: Skipped due to 4 GB RAM limit on the development machine (`npm run doctor` warning).
+- **Bonus billing (Paybox)**: Skipped to focus on core reliability, E2EE notes, and tests.
 
 ## Assumptions
 
-- The `workspaces` JWT claim from the IdP is an array of `{id, role}` objects.
-- `occurred_at` timestamps from Pigeon are reliable enough to sort inbound messages; duplicated events don't reorder (we sort the full set each time).
-- An agent claiming their own already-claimed conversation returns 200 (the brief says "The holder claiming again gets 200").
-- A workspace not in `config.pigeon.apiKeys` is unknown; `/__grader/reply` and `/__grader/claim` return 404 for unknown workspaces.
+- Known workspaces are defined by `config.pigeon.apiKeys` (`ws_acme`, `ws_globex`); unknown workspaces return `404` on `/__grader/reply` and `/__grader/claim`, and `200` (ignored) on `/webhooks/pigeon`.
+- `claim` for an already-held conversation by the same agent returns `200` without emitting a duplicate `conversation.assigned` event.
 
 ## Known issues / what I know is still wrong
 
-- **Level 3 failover timing**: The 2-second polling interval means failed-instance work takes up to 2 seconds to pick up. For the 60-second failover window this should be fine.
-- **WS replay ordering**: After reconnect with `?after=N`, events are replayed from MongoDB then live events continue. There's a small race where events that arrive between the last DB query and the pub/sub subscription could be missed. Mitigated by the fact that reconnect is fast.
-- **Pigeon 12s slow response**: I abort at 8s and requeue. The Idempotency-Key means Pigeon won't send twice, but the status webhook may still arrive and we update from there. This could leave the status as "queued" briefly.
-- **Redis lock expiry**: The send lock expires in 30s. If a processor crashes holding the lock, the next instance picks up after 30s. This is acceptable for the test scenario.
+- **Key distribution trust**: Public keys (`user_keys`) are served by the server without out-of-band fingerprint verification (documented in `PROTOCOL.md`).
+- **Windows local check environment**: `harness/check.js` spawns `sh -c` and uses POSIX negative-PID `SIGKILL`; on Windows, Git Bash `sh` is required in `PATH` and `SIGKILL` process-group termination behaves differently than on Linux.

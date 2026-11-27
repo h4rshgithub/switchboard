@@ -6,12 +6,18 @@ import { ensureConversation, isKnownWorkspace } from './domain.js';
 import { emitWorkspaceEvent } from './events.js';
 import { getRedis, getSubRedis } from './redis.js';
 
-const STATUS_RANK: Record<string, number> = {
+export const STATUS_RANK: Record<string, number> = {
   queued: 1,
   sent: 2,
   delivered: 3,
   failed: 3,
 };
+
+export function shouldAdvanceStatus(currentRank: number, nextStatus: string): number | null {
+  const rank = STATUS_RANK[nextStatus];
+  if (!rank || rank <= currentRank) return null;
+  return rank;
+}
 
 const MAX_TIMESTAMP_SKEW_SEC = 300; // 5 minutes
 const PIGEON_TIMEOUT_MS = 14_000;
