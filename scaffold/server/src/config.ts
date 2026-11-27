@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 // Every setting comes from the environment. The defaults match the harness,
 // so this runs with no .env file. If ../../.env exists it is loaded first.
 try {
@@ -9,9 +11,11 @@ try {
 const env = (name: string, fallback: string) => process.env[name] ?? fallback;
 
 export const config = {
+  instanceId: randomUUID(),
   port: Number(env('PORT', '4000')),
   webOrigin: env('WEB_ORIGIN', 'http://localhost:5173'),
   graderToken: env('GRADER_TOKEN', 'grader-dev-token'),
+  sessionSecret: env('SESSION_SECRET', 'switchboard-dev-session-secret'),
   mongoUrl: env('MONGO_URL', 'mongodb://localhost:27017/switchboard'),
   redisUrl: env('REDIS_URL', 'redis://localhost:6379'),
   elasticsearchUrl: env('ELASTICSEARCH_URL', 'http://localhost:9200'),
